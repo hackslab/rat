@@ -1,0 +1,9 @@
+pyinstaller
+mss
+Pillow
+opencv-python
+numpy
+customtkinter
+pywin32
+pynput
+tkinterdnd2
