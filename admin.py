@@ -26,7 +26,7 @@ PROMPT = "admin> "
 
 # --- Configuration ---
 # This console connects to the central server.
-SERVER_IP = "127.0.0.1"
+SERVER_IP = "164.92.208.145"
 ADMIN_PORT = 4131
 
 # The base port for starting to look for free ports for video streams.
