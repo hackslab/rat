@@ -1,0 +1,11 @@
+services:
+  rat-server:
+    build: .
+    container_name: rat-server
+    restart: unless-stopped
+    ports:
+      - "3131:3131" # Client Port
+      - "4131:4131" # Admin Port
+    volumes:
+      - ./db:/app/db
+      - ./files:/app/files

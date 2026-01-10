@@ -1,0 +1,15 @@
+.git
+.github
+venv
+__pycache__
+*.pyc
+*.spec
+build/
+dist/
+client.py
+admin.py
+build.bat
+db/
+files/
+deployment/
+requirements.txt
