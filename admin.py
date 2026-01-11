@@ -168,10 +168,11 @@ class ControlViewer(threading.Thread):
         self.window_name = f"Controlling Client {self.client_id}"
         self.key_map = {
             13: 'enter', 8: 'backspace', 9: 'tab', 27: 'esc',
-            # Special keys that don't have a simple ASCII representation
             # Note: Arrow keys, function keys, etc., produce multi-byte sequences
             # that are harder to capture with cv2.waitKey. This is a limitation.
         }
+        self.last_move_time = 0
+
 
     def stop(self):
         self._stop_event.set()
@@ -209,6 +210,13 @@ class ControlViewer(threading.Thread):
         }
 
         if event in event_map:
+            # Throttle mouse move events
+            if event == cv2.EVENT_MOUSEMOVE:
+                current_time = time.time()
+                if current_time - self.last_move_time < 0.05: # 50ms throttle
+                    return
+                self.last_move_time = current_time
+
             event_data.update(event_map[event])
             self.send_control_event(event_data)
 
@@ -312,13 +320,14 @@ def find_free_port(start_port):
                 return port
         port += 1
 
-def start_watch_session(sock, client_id, fps, quality, no_cursor):
+def start_watch_session(sock, client_id, fps, quality, no_cursor, scale):
     request = {
         "action": "initiate_watch",
         "client_id": client_id,
         "fps": fps,
         "quality": quality,
-        "capture_cursor": not no_cursor
+        "capture_cursor": not no_cursor,
+        "scale": scale
     }
 
     if send_json(sock, request):
@@ -903,12 +912,21 @@ def handle_watch(sock, args):
     import argparse # Keep argparse local to this handler
     parser = argparse.ArgumentParser(prog='watch', description='Start a screen watch session.')
     parser.add_argument('client_id', type=int, help='The ID of the client to watch.')
+    parser.add_argument('--client_id', type=int) # Handle positional argument manually if needed, but argparse expects it 
+    # Actually, the args passed to this function are already split.
+    # parser.add_argument('client_id', ...) works if args matches.
+    # But usually args[0] is client_id. The previous code manually parsed usage 'watch <id>'.
+    # We will stick to the existing parser definition but add scale.
+    
+    # Re-reading original handle_watch...
+    # It parses 'client_id' as a positional argument.
     parser.add_argument('--fps', type=int, default=30, help='Frames per second for the stream.')
     parser.add_argument('--quality', type=int, default=70, help='JPEG quality (1-100).')
     parser.add_argument('--no-cursor', action='store_true', help='Do not capture the mouse cursor.')
+    parser.add_argument('--scale', type=float, default=0.5, help='Resolution scale (0.1-1.0).')
     try:
         parsed_args = parser.parse_args(args)
-        start_watch_session(sock, parsed_args.client_id, parsed_args.fps, parsed_args.quality, parsed_args.no_cursor)
+        start_watch_session(sock, parsed_args.client_id, parsed_args.fps, parsed_args.quality, parsed_args.no_cursor, parsed_args.scale)
     except SystemExit: # argparse calls exit on --help or error
         pass
 
