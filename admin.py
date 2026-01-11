@@ -20,7 +20,14 @@ import queue
 import time
 import random
 import string
+import random
+import string
 from pathlib import Path
+import asyncio
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate
+from aiortc.contrib.media import MediaBlackhole
+import av
+from PIL import Image, ImageTk
 
 PROMPT = "admin> "
 
@@ -39,6 +46,11 @@ IS_SUPERADMIN = False
 ACTIVE_EXPLORERS = {}
 ROOT = None # Will hold the main CTk window
 command_finished_event = threading.Event()
+# WebRTC Globals
+webrtc_pc = None
+webrtc_loop = None
+webrtc_thread = None
+webrtc_video_panel = None # Tkinter label to show video
 # ---------------
 HEADER_LENGTH = 10
 
@@ -294,6 +306,17 @@ def start_session(sock, client_id):
                     print("\n[-] Connection to server lost.")
                     return
 
+                # --- Handle WebRTC messages that might arrive during shell session ---
+                if response.get("type") == "webrtc_answer":
+                   if webrtc_pc:
+                       asyncio.run_coroutine_threadsafe(handle_answer(webrtc_pc, response.get("sdp")), webrtc_loop)
+                   continue
+                elif response.get("type") == "webrtc_candidate":
+                   if webrtc_pc:
+                       asyncio.run_coroutine_threadsafe(handle_ice_candidate(webrtc_pc, response.get("candidate")), webrtc_loop)
+                   continue
+                # -------------------------------------------------------------------
+
                 if response.get("type") == "response" and response.get("client_id") == client_id:
                     print(response.get("data", ""), end='')
                     break # Got our response, break inner loop to get next command
@@ -311,54 +334,143 @@ def start_session(sock, client_id):
             print("\n[!] Session interrupted. Type 'exit' to return to main menu.")
             break # Exit the session loop
 
-def find_free_port(start_port):
-    port = start_port
+            print("\n[!] Session interrupted. Type 'exit' to return to main menu.")
+            break # Exit the session loop
+
+# --- WebRTC Admin Implementation ---
+def run_webrtc_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def ensure_webrtc_thread():
+    global webrtc_loop, webrtc_thread
+    if webrtc_thread is None or not webrtc_thread.is_alive():
+        webrtc_loop = asyncio.new_event_loop()
+        webrtc_thread = threading.Thread(target=run_webrtc_loop, args=(webrtc_loop,), daemon=True)
+        webrtc_thread.start()
+    return webrtc_loop
+
+async def create_offer(client_id, sock):
+    global webrtc_pc
+    webrtc_pc = RTCPeerConnection()
+
+    @webrtc_pc.on("track")
+    def on_track(track):
+        print("Track received:", track.kind)
+        if track.kind == "video":
+            # Launch display logic
+            # We can't block the asyncio loop, so we consume frames and update GUI
+            asyncio.ensure_future(display_track(track))
+
+    # Create Data Channel (optional, for control later)
+    # channel = webrtc_pc.createDataChannel("chat")
+
+    # Create Offer
+    # We add a transceiver to tell the other side we want to receive video
+    webrtc_pc.addTransceiver("video", direction="recvonly")
+    
+    offer = await webrtc_pc.createOffer()
+    await webrtc_pc.setLocalDescription(offer)
+
+    # Send Offer
+    msg = {
+        "type": "webrtc_offer",
+        "client_id": client_id,
+        "sdp": webrtc_pc.localDescription.sdp
+    }
+    send_json(sock, msg)
+
+async def display_track(track):
+    """
+    Consumes frames from the track and updates the Tkinter GUI.
+    """
+    global webrtc_video_panel
+    # Create a separate window for the stream
+    # Using `ROOT.after` to manipulate GUI from this async thread
+    
+    class VideoWindow:
+        def __init__(self):
+            self.root = tkinter.Toplevel()
+            self.root.title("WebRTC Stream")
+            self.label = tkinter.Label(self.root)
+            self.label.pack()
+            self.stop = False
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        def on_close(self):
+            self.stop = True
+            self.root.destroy()
+            # Close connection
+            # This requires callback coordination, for now we rely on the loop
+
+    # We need to construct this on the main thread
+    # This is tricky with asyncio + tkinter.
+    # We'll use a Queue to send frames to the main thread? 
+    # Or just update if we can access ROOT. 
+    # Ideally, we open the window in main thread.
+    
+    # Simple approach: emit frames to a queue consumed by main thread?
+    # Better: Use OpenCV imshow for now (simplest migration from existing).
+    
     while True:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            # Check for a free port on the local machine
-            if s.connect_ex(('127.0.0.1', port)) != 0:
-                return port
-        port += 1
+        try:
+            frame = await track.recv()
+            # frame is av.VideoFrame
+            # Convert to numpy
+            img = frame.to_ndarray(format="bgr24")
+            
+            # Show with OpenCV
+            cv2.imshow("WebRTC Stream", img)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        except Exception as e:
+            print(f"Stream ended: {e}")
+            break
+    cv2.destroyWindow("WebRTC Stream")
+    # Clean up PC
+    global webrtc_pc
+    if webrtc_pc:
+        await webrtc_pc.close()
+        webrtc_pc = None
+
+async def handle_answer(pc, sdp):
+    remote_desc = RTCSessionDescription(sdp=sdp, type="answer")
+    await pc.setRemoteDescription(remote_desc)
+
+async def handle_ice_candidate(pc, candidate_data):
+    # Same candidate hydration logic
+    candidate = RTCIceCandidate(
+        component=candidate_data['component'],
+        foundation=candidate_data['foundation'],
+        ip=candidate_data['ip'],
+        port=candidate_data['port'],
+        priority=candidate_data['priority'],
+        protocol=candidate_data['protocol'],
+        type=candidate_data['type'],
+        sdpMid=candidate_data['sdpMid'],
+        sdpMLineIndex=candidate_data['sdpMLineIndex']
+    )
+    await pc.addIceCandidate(candidate)
+# -----------------------------------
 
 def start_watch_session(sock, client_id, fps, quality, no_cursor, scale):
-    request = {
-        "action": "initiate_watch",
-        "client_id": client_id,
-        "fps": fps,
-        "quality": quality,
-        "capture_cursor": not no_cursor,
-        "scale": scale
-    }
+    print(f"[+] Initiating WebRTC negotiation with client {client_id}...")
+    
+    ensure_webrtc_thread()
+    # Schedule offer creation
+    asyncio.run_coroutine_threadsafe(create_offer(client_id, sock), webrtc_loop)
+    
+    print("[*] Offer sent. Waiting for stream/answer...")
+    # The stream will pop up via OpenCV when track arrives.
+    # We don't block here anymore.
+    input("Press Enter to stop watching (after window opens)...")
+    
+    # Cleanup (Reset PC)
+    # real world would send a "stop" message
+    global webrtc_pc
+    if webrtc_pc:
+        asyncio.run_coroutine_threadsafe(webrtc_pc.close(), webrtc_loop)
 
-    if send_json(sock, request):
-        print(f"[+] Request sent. Waiting for server bridge...")
-        # Wait for 'watch_ready'
-        try:
-            # Simple loop to consume queue until we find our response
-            # Note: This might consume other messages, effectively hiding them from the main CLI
-            # but since we are in a 'modal' command state, this is acceptable for now.
-            start_wait = time.time()
-            while time.time() - start_wait < 30:
-                try:
-                    msg = message_queue.get(timeout=1)
-                    if msg.get('type') == 'watch_ready' and msg.get('client_id') == client_id:
-                        port = msg.get('port')
-                        print(f"[+] Server bridge ready on port {port}. connecting...")
-                        viewer_thread = StreamViewer(client_id, port)
-                        viewer_thread.start()
-                        return
-                    elif msg.get('type') == 'error':
-                        print(f"[-] Server error: {msg.get('message')}")
-                        return
-                    else:
-                        print(f"[Captured Async Message]: {msg}")
-                except queue.Empty:
-                    continue
-            print("[-] Timeout waiting for server bridge.")
-        except KeyboardInterrupt:
-            print("\n[-] Cancelled.")
-    else:
-        print(f"[-] Failed to send watch command to server.")
 
 def start_control_session(sock, client_id):
     request = {

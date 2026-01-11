@@ -387,7 +387,19 @@ def handle_admin_connection(conn, addr):
                 break
 
             action = request.get('action')
+            msg_type = request.get('type')
             is_superadmin = current_admin.get('is_superadmin', False)
+
+            # --- WebRTC Signaling Routing ---
+            if msg_type in ["webrtc_offer", "webrtc_answer", "webrtc_candidate"]:
+                client_id = request.get('client_id')
+                client_info = get_client_by_id(client_id)
+                if client_info:
+                    send_json(client_info['conn'], request)
+                else:
+                    send_json(conn, {"type": "error", "message": f"Client {client_id} not found."})
+                continue
+            # --------------------------------
 
             if action == 'list':
                 with clients_lock:

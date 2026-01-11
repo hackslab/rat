@@ -7,3 +7,6 @@ customtkinter
 pywin32
 pynput
 tkinterdnd2
+aiortc
+av
+dxcam

