@@ -243,6 +243,19 @@ class ControlViewer(threading.Thread):
 
     def run(self):
         stream_conn, control_conn = None, None
+        frame_queue = queue.Queue()
+        
+        def receive_worker(conn, q):
+            while not self._stop_event.is_set():
+                try:
+                    # Monitor index is ignored for now in single-window control
+                    _, frame_bytes = receive_frame(conn)
+                    if frame_bytes is None:
+                        break
+                    q.put(frame_bytes)
+                except:
+                    break
+        
         try:
             stream_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             stream_conn.connect((SERVER_IP, self.stream_port))
@@ -255,16 +268,52 @@ class ControlViewer(threading.Thread):
             cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
             cv2.setMouseCallback(self.window_name, self.mouse_callback)
 
-            while not self._stop_event.is_set():
-                _, frame_bytes = receive_frame(stream_conn)
-                if frame_bytes is None: break
-                frame = np.frombuffer(frame_bytes, dtype=np.uint8)
-                img = cv2.imdecode(frame, cv2.IMREAD_COLOR)
-                if img is not None: cv2.imshow(self.window_name, img)
+            # Start receiver thread
+            receiver_thread = threading.Thread(target=receive_worker, args=(stream_conn, frame_queue), daemon=True)
+            receiver_thread.start()
 
-                key = cv2.waitKey(1) & 0xFF
+            window_initialized = False
+
+            while not self._stop_event.is_set():
+                # Non-blocking check for new frames
+                try:
+                    while not frame_queue.empty():
+                        frame_bytes = frame_queue.get_nowait()
+                        frame = np.frombuffer(frame_bytes, dtype=np.uint8)
+                        img = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                        if img is not None: 
+                            # Check availability before showing to avoid resurrection
+                            if window_initialized:
+                                try:
+                                    if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                                        self.stop()
+                                        break
+                                except cv2.error:
+                                    pass
+                            
+                            cv2.imshow(self.window_name, img)
+                            window_initialized = True
+                except queue.Empty:
+                    pass
+                
+                if self._stop_event.is_set(): break
+
+                # Check for receiver death
+                if not receiver_thread.is_alive() and frame_queue.empty():
+                    break
+
+                # Pump UI events frequently
+                key = cv2.waitKey(10) & 0xFF
                 if key != 255: self.handle_key_press(key)
-                if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1: break
+                
+                # Check if window was closed
+                if window_initialized:
+                    try:
+                        if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                            break
+                    except cv2.error:
+                         break
+                     
         except (socket.timeout, OSError):
             print(f"\n[!] Client {self.client_id} failed to connect to control/stream ports.")
         finally:
@@ -383,51 +432,83 @@ async def create_offer(client_id, sock):
 async def display_track(track):
     """
     Consumes frames from the track and updates the Tkinter GUI.
+    Decoupled implementation to prevent UI freeze and allow resizing.
     """
-    global webrtc_video_panel
-    # Create a separate window for the stream
-    # Using `ROOT.after` to manipulate GUI from this async thread
+    window_name = "WebRTC Stream"
     
-    class VideoWindow:
-        def __init__(self):
-            self.root = tkinter.Toplevel()
-            self.root.title("WebRTC Stream")
-            self.label = tkinter.Label(self.root)
-            self.label.pack()
-            self.stop = False
-            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        
-        def on_close(self):
-            self.stop = True
-            self.root.destroy()
-            # Close connection
-            # This requires callback coordination, for now we rely on the loop
+    # Enable resizing
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
-    # We need to construct this on the main thread
-    # This is tricky with asyncio + tkinter.
-    # We'll use a Queue to send frames to the main thread? 
-    # Or just update if we can access ROOT. 
-    # Ideally, we open the window in main thread.
-    
-    # Simple approach: emit frames to a queue consumed by main thread?
-    # Better: Use OpenCV imshow for now (simplest migration from existing).
-    
-    while True:
+    frame_queue = asyncio.Queue()
+    stop_signal = asyncio.Event()
+
+    async def producer():
         try:
-            frame = await track.recv()
-            # frame is av.VideoFrame
-            # Convert to numpy
-            img = frame.to_ndarray(format="bgr24")
-            
-            # Show with OpenCV
-            cv2.imshow("WebRTC Stream", img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            while not stop_signal.is_set():
+                frame = await track.recv()
+                # If queue is full, drop oldest to keep latency low
+                if frame_queue.qsize() > 5:
+                    try: frame_queue.get_nowait()
+                    except: pass
+                await frame_queue.put(frame)
+        except Exception:
+            pass
+        finally:
+            stop_signal.set()
+
+    # Start producer task
+    producer_task = asyncio.create_task(producer())
+
+    window_initialized = False
+
+    try:
+        while not stop_signal.is_set():
+            # Process all available frames in queue (drain for latency catch-up)
+            latest_frame = None
+            try:
+                while not frame_queue.empty():
+                    latest_frame = frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+
+            if latest_frame:
+                img = latest_frame.to_ndarray(format="bgr24")
+                
+                # Check existence before show
+                if window_initialized:
+                    try:
+                        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                            stop_signal.set()
+                            break
+                    except:
+                         pass
+
+                cv2.imshow(window_name, img)
+                window_initialized = True
+
+            # UI Pulse
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                stop_signal.set()
                 break
-        except Exception as e:
-            print(f"Stream ended: {e}")
-            break
-    cv2.destroyWindow("WebRTC Stream")
-    # Clean up PC
+            
+            if window_initialized:
+                try:
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        stop_signal.set()
+                        break
+                except:
+                    pass
+
+            # Important: Yield to let producer run
+            await asyncio.sleep(0.01)
+
+    except Exception as e:
+        print(f"Stream ended: {e}")
+    finally:
+        stop_signal.set()
+        try: cv2.destroyWindow(window_name)
+        except: pass
+        
     global webrtc_pc
     if webrtc_pc:
         await webrtc_pc.close()
@@ -454,6 +535,7 @@ async def handle_ice_candidate(pc, candidate_data):
 # -----------------------------------
 
 def start_watch_session(sock, client_id, fps, quality, no_cursor, scale):
+    global webrtc_pc
     print(f"[+] Initiating WebRTC negotiation with client {client_id}...")
     
     ensure_webrtc_thread()
@@ -463,11 +545,37 @@ def start_watch_session(sock, client_id, fps, quality, no_cursor, scale):
     print("[*] Offer sent. Waiting for stream/answer...")
     # The stream will pop up via OpenCV when track arrives.
     # We don't block here anymore.
-    input("Press Enter to stop watching (after window opens)...")
+
+    print("Press Ctrl+C to stop watching...")
+
+    try:
+        while True:
+            try:
+                # Poll the queue for signaling messages
+                # Timeout allows us to check for KeyboardInterrupt periodically
+                response = message_queue.get(timeout=0.2)
+                
+                if response is None: # Connection lost signal
+                    break
+
+                msg_type = response.get("type")
+                
+                if msg_type == "webrtc_answer":
+                    print("[+] Received WebRTC Answer. Setting remote description...")
+                    asyncio.run_coroutine_threadsafe(handle_answer(webrtc_pc, response.get("sdp")), webrtc_loop)
+                elif msg_type == "webrtc_candidate":
+                    candidate_val = response.get("candidate")
+                    if candidate_val:
+                         # print("[.] Received ICE Candidate.") 
+                         asyncio.run_coroutine_threadsafe(handle_ice_candidate(webrtc_pc, candidate_val), webrtc_loop)
+
+            except queue.Empty:
+                continue
+    except KeyboardInterrupt:
+        print("\nStopping watch session...")
     
     # Cleanup (Reset PC)
     # real world would send a "stop" message
-    global webrtc_pc
     if webrtc_pc:
         asyncio.run_coroutine_threadsafe(webrtc_pc.close(), webrtc_loop)
 
